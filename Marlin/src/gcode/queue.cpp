@@ -44,7 +44,7 @@ GCodeQueue queue;
 #endif
 
 #if ENABLED(POWER_LOSS_RECOVERY)
-  #include "../feature/power_loss_recovery.h"
+  #include "../feature/powerloss.h"
 #endif
 
 /**
@@ -86,22 +86,26 @@ static int serial_count[NUM_SERIAL] = { 0 };
 bool send_ok[BUFSIZE];
 
 /**
- * Next Injected Command pointer. nullptr if no commands are being injected.
- * Used by Marlin internally to ensure that commands initiated from within
- * are enqueued ahead of any pending serial or sd card commands.
+ * Next Injected PROGMEM Command pointer. (nullptr == empty)
+ * Internal commands are enqueued ahead of serial / SD commands.
  */
-static PGM_P injected_commands_P = nullptr;
+PGM_P GCodeQueue::injected_commands_P; // = nullptr
+
+/**
+ * Injected SRAM Commands
+ */
+char GCodeQueue::injected_commands[64]; // = { 0 }
 
 GCodeQueue::GCodeQueue() {
   // Send "ok" after commands by default
-  for (uint8_t i = 0; i < COUNT(send_ok); i++) send_ok[i] = true;
+  LOOP_L_N(i, COUNT(send_ok)) send_ok[i] = true;
 }
 
 /**
  * Check whether there are any commands yet to be executed
  */
 bool GCodeQueue::has_commands_queued() {
-  return queue.length || injected_commands_P;
+  return queue.length || injected_commands_P || injected_commands[0];
 }
 
 /**
@@ -123,9 +127,7 @@ void GCodeQueue::_commit_command(bool say_ok
   #if NUM_SERIAL > 1
     port[index_w] = p;
   #endif
-  #if ENABLED(POWER_LOSS_RECOVERY)
-    recovery.commit_sdpos(index_w);
-  #endif
+  TERN_(POWER_LOSS_RECOVERY, recovery.commit_sdpos(index_w));
   if (++index_w >= BUFSIZE) index_w = 0;
   length++;
 }
@@ -150,6 +152,8 @@ bool GCodeQueue::_enqueue(const char* cmd, bool say_ok/*=false*/
   return true;
 }
 
+#define ISEOL(C) ((C) == '\n' || (C) == '\r')
+
 /**
  * Enqueue with Serial Echo
  * Return true if the command was consumed
@@ -160,7 +164,7 @@ bool GCodeQueue::enqueue_one(const char* cmd) {
   //SERIAL_ECHO(cmd);
   //SERIAL_ECHOPGM("\") \n");
 
-  if (*cmd == 0 || *cmd == '\n' || *cmd == '\r') return true;
+  if (*cmd == 0 || ISEOL(*cmd)) return true;
 
   if (_enqueue(cmd)) {
     SERIAL_ECHO_MSG(STR_ENQUEUEING, cmd, "\"");
@@ -170,11 +174,10 @@ bool GCodeQueue::enqueue_one(const char* cmd) {
 }
 
 /**
- * Process the next "immediate" command.
- * Return 'true' if any commands were processed,
- * or remain to process.
+ * Process the next "immediate" command from PROGMEM.
+ * Return 'true' if any commands were processed.
  */
-bool GCodeQueue::process_injected_command() {
+bool GCodeQueue::process_injected_command_P() {
   if (injected_commands_P == nullptr) return false;
 
   char c;
@@ -196,18 +199,53 @@ bool GCodeQueue::process_injected_command() {
 }
 
 /**
- * Enqueue one or many commands to run from program memory.
- * Do not inject a comment or use leading spaces!
- * Aborts the current queue, if any.
- * Note: process_injected_command() will be called to drain any commands afterwards
+ * Process the next "immediate" command from SRAM.
+ * Return 'true' if any commands were processed.
  */
-void GCodeQueue::inject_P(PGM_P const pgcode) { injected_commands_P = pgcode; }
+bool GCodeQueue::process_injected_command() {
+  if (injected_commands[0] == '\0') return false;
+
+  char c;
+  size_t i = 0;
+  while ((c = injected_commands[i]) && c != '\n') i++;
+
+  // Execute a non-blank command
+  if (i) {
+    injected_commands[i] = '\0';
+    parser.parse(injected_commands);
+    gcode.process_parsed_command();
+  }
+
+  // Copy the next command into place
+  for (
+    uint8_t d = 0, s = i + !!c;                     // dst, src
+    (injected_commands[d] = injected_commands[s]);  // copy, exit if 0
+    d++, s++                                        // next dst, src
+  );
+
+  return true;
+}
 
 /**
  * Enqueue and return only when commands are actually enqueued.
  * Never call this from a G-code handler!
  */
 void GCodeQueue::enqueue_one_now(const char* cmd) { while (!enqueue_one(cmd)) idle(); }
+
+/**
+ * Attempt to enqueue a single G-code command
+ * and return 'true' if successful.
+ */
+bool GCodeQueue::enqueue_one_P(PGM_P const pgcode) {
+  size_t i = 0;
+  PGM_P p = pgcode;
+  char c;
+  while ((c = pgm_read_byte(&p[i])) && c != '\n') i++;
+  char cmd[i + 1];
+  memcpy_P(cmd, p, i);
+  cmd[i] = '\0';
+  return _enqueue(cmd);
+}
 
 /**
  * Enqueue from program memory and return only when commands are actually enqueued
@@ -410,14 +448,14 @@ void GCodeQueue::get_serial_commands() {
    * Loop while serial characters are incoming and the queue is not full
    */
   while (length < BUFSIZE && serial_data_available()) {
-    for (uint8_t i = 0; i < NUM_SERIAL; ++i) {
+    LOOP_L_N(i, NUM_SERIAL) {
 
       const int c = read_serial(i);
       if (c < 0) continue;
 
       const char serial_char = c;
 
-      if (serial_char == '\n' || serial_char == '\r') {
+      if (ISEOL(serial_char)) {
 
         // Reset our state, continue if the line was empty
         if (process_line_done(serial_input_state[i], serial_line_buffer[i], serial_count[i]))
@@ -487,9 +525,7 @@ void GCodeQueue::get_serial_commands() {
           // Process critical commands early
           if (strcmp(command, "M108") == 0) {
             wait_for_heatup = false;
-            #if HAS_LCD_MENU
-              wait_for_user = false;
-            #endif
+            TERN_(HAS_LCD_MENU, wait_for_user = false);
           }
           if (strcmp(command, "M112") == 0) kill(M112_KILL_STR, nullptr, true);
           if (strcmp(command, "M410") == 0) quickstop_stepper();
@@ -534,7 +570,7 @@ void GCodeQueue::get_serial_commands() {
       if (n < 0 && !card_eof) { SERIAL_ERROR_MSG(STR_SD_ERR_READ); continue; }
 
       const char sd_char = (char)n;
-      const bool is_eol = sd_char == '\n' || sd_char == '\r';
+      const bool is_eol = ISEOL(sd_char);
       if (is_eol || card_eof) {
 
         // Reset stream state, terminate the buffer, and commit a non-empty command
@@ -558,7 +594,7 @@ void GCodeQueue::get_serial_commands() {
 
 /**
  * Add to the circular command queue the next command from:
- *  - The command-injection queue (injected_commands_P)
+ *  - The command-injection queues (injected_commands_P, injected_commands)
  *  - The active serial input (usually USB)
  *  - The SD card file being actively printed
  */
@@ -566,9 +602,7 @@ void GCodeQueue::get_available_commands() {
 
   get_serial_commands();
 
-  #if ENABLED(SDSUPPORT)
-    get_sdcard_commands();
-  #endif
+  TERN_(SDSUPPORT, get_sdcard_commands());
 }
 
 /**
@@ -577,7 +611,7 @@ void GCodeQueue::get_available_commands() {
 void GCodeQueue::advance() {
 
   // Process immediate commands
-  if (process_injected_command()) return;
+  if (process_injected_command_P() || process_injected_command()) return;
 
   // Return if the G-code buffer is empty
   if (!length) return;

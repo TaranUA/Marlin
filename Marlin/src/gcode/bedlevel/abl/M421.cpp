@@ -32,7 +32,7 @@
 #include "../../../feature/bedlevel/bedlevel.h"
 
 #if ENABLED(EXTENSIBLE_UI)
-  #include "../../../lcd/extensible_ui/ui_api.h"
+  #include "../../../lcd/extui/ui_api.h"
 #endif
 
 /**
@@ -55,12 +55,8 @@ void GcodeSuite::M421() {
     SERIAL_ERROR_MSG(STR_ERR_MESH_XY);
   else {
     z_values[ix][iy] = parser.value_linear_units() + (hasQ ? z_values[ix][iy] : 0);
-    #if ENABLED(ABL_BILINEAR_SUBDIVISION)
-      bed_level_virt_interpolate();
-    #endif
-    #if ENABLED(EXTENSIBLE_UI)
-      ExtUI::onMeshUpdate(ix, iy, z_values[ix][iy]);
-    #endif
+    TERN_(ABL_BILINEAR_SUBDIVISION, bed_level_virt_interpolate());
+    TERN_(EXTENSIBLE_UI, ExtUI::onMeshUpdate(ix, iy, z_values[ix][iy]));
   }
 }
 

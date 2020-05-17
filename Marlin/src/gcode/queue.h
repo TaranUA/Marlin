@@ -66,16 +66,41 @@ public:
   static void clear();
 
   /**
-   * Enqueue one or many commands to run from program memory.
-   * Aborts the current queue, if any.
-   * Note: process_injected_command() will process them.
+   * Next Injected Command (PROGMEM) pointer. (nullptr == empty)
+   * Internal commands are enqueued ahead of serial / SD commands.
    */
-  static void inject_P(PGM_P const pgcode);
+  static PGM_P injected_commands_P;
+
+  /**
+   * Injected Commands (SRAM)
+   */
+  static char injected_commands[64];
+
+  /**
+   * Enqueue command(s) to run from PROGMEM. Drained by process_injected_command_P().
+   * Don't inject comments or use leading spaces!
+   * Aborts the current PROGMEM queue so only use for one or two commands.
+   */
+  static inline void inject_P(PGM_P const pgcode) { injected_commands_P = pgcode; }
+
+  /**
+   * Enqueue command(s) to run from SRAM. Drained by process_injected_command().
+   * Aborts the current SRAM queue so only use for one or two commands.
+   */
+  static inline void inject(char * const gcode) {
+    strncpy(injected_commands, gcode, sizeof(injected_commands) - 1);
+  }
 
   /**
    * Enqueue and return only when commands are actually enqueued
    */
   static void enqueue_one_now(const char* cmd);
+
+  /**
+   * Attempt to enqueue a single G-code command
+   * and return 'true' if successful.
+   */
+  static bool enqueue_one_P(PGM_P const pgcode);
 
   /**
    * Enqueue from program memory and return only when commands are actually enqueued
@@ -117,12 +142,6 @@ public:
    */
   static void flush_and_request_resend();
 
-  /**
-   * Attempt to enqueue a single G-code command
-   * and return 'true' if successful.
-   */
-  FORCE_INLINE static bool enqueue_P(const char* cmd) { return _enqueue(cmd); }
-
 private:
 
   static uint8_t index_w;  // Ring buffer write position
@@ -145,7 +164,10 @@ private:
     #endif
   );
 
-  // Process the next "immediate" command
+  // Process the next "immediate" command (PROGMEM)
+  static bool process_injected_command_P();
+
+  // Process the next "immediate" command (SRAM)
   static bool process_injected_command();
 
   /**
